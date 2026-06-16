@@ -1,16 +1,32 @@
 ---
-name: petdex
-description: Install and select animated petdex mascots for Hermes.
-version: 1.0.0
-author: Hermes Agent
-license: MIT
-platforms: [linux, macos, windows]
-metadata:
-  hermes:
-    tags: [petdex, mascot, display, cli, tui, desktop]
-    category: productivity
-    homepage: https://petdex.dev
+title: "Petdex — Install and select animated petdex mascots for Hermes"
+sidebar_label: "Petdex"
+description: "Install and select animated petdex mascots for Hermes"
 ---
+
+{/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
+
+# Petdex
+
+Install and select animated petdex mascots for Hermes.
+
+## Skill metadata
+
+| | |
+|---|---|
+| Source | Bundled (installed by default) |
+| Path | `skills/productivity/petdex` |
+| Version | `1.0.0` |
+| Author | Hermes Agent |
+| License | MIT |
+| Platforms | linux, macos, windows |
+| Tags | `petdex`, `mascot`, `display`, `cli`, `tui`, `desktop` |
+
+## Reference: full SKILL.md
+
+:::info
+The following is the complete skill definition that Hermes loads when this skill is triggered. This is what the agent sees as instructions when the skill is active.
+:::
 
 # Petdex Skill
 
