@@ -9,7 +9,43 @@ const DEFAULT_LOOP_MS = 1100
 // Mirrors agent.pet.constants.DEFAULT_SCALE — fallback only; the gateway sends
 // the configured scale.
 const DEFAULT_SCALE = 0.33
-const DEFAULT_STATE_ROWS = ['idle', 'wave', 'run', 'failed', 'review', 'jump', 'extra1', 'extra2']
+// Mirrors agent.pet.constants.CODEX_STATE_ROWS (Petdex current taxonomy).
+const DEFAULT_STATE_ROWS = [
+  'idle',
+  'running-right',
+  'running-left',
+  'waving',
+  'jumping',
+  'failed',
+  'waiting',
+  'running',
+  'review'
+]
+
+const STATE_ALIASES: Record<PetState, string[]> = {
+  idle: ['idle'],
+  wave: ['wave', 'waving'],
+  jump: ['jump', 'jumping'],
+  run: ['run', 'running'],
+  failed: ['failed'],
+  review: ['review'],
+  waiting: ['waiting']
+}
+
+const ROW_TO_STATE: Record<string, PetState> = {
+  idle: 'idle',
+  wave: 'wave',
+  waving: 'wave',
+  jump: 'jump',
+  jumping: 'jump',
+  run: 'run',
+  running: 'run',
+  'running-right': 'run',
+  'running-left': 'run',
+  failed: 'failed',
+  review: 'review',
+  waiting: 'waiting'
+}
 
 interface PetSpriteProps {
   info: PetInfo
@@ -21,6 +57,8 @@ interface PetSpriteProps {
    * being driven by) the real agent activity that moves the floating mascot.
    */
   stateOverride?: PetState
+  /** Force a concrete row name from `info.stateRows` (e.g. `running-right`). */
+  rowOverride?: string
 }
 
 /**
@@ -34,15 +72,20 @@ interface PetSpriteProps {
  * with `memo`, this component effectively never re-renders after mount until
  * the pet itself changes.
  */
-function PetSpriteImpl({ info, zoom = 1, stateOverride }: PetSpriteProps) {
+function PetSpriteImpl({ info, zoom = 1, stateOverride, rowOverride }: PetSpriteProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
   const stateRef = useRef<PetState>($petState.get())
   const overrideRef = useRef<PetState | undefined>(stateOverride)
+  const rowOverrideRef = useRef<string | undefined>(rowOverride)
 
   // Keep the override current without re-running the RAF setup effect.
   useEffect(() => {
     overrideRef.current = stateOverride
   }, [stateOverride])
+
+  useEffect(() => {
+    rowOverrideRef.current = rowOverride
+  }, [rowOverride])
 
   const frameW = info.frameW ?? DEFAULT_FRAME_W
   const frameH = info.frameH ?? DEFAULT_FRAME_H
@@ -92,10 +135,14 @@ function PetSpriteImpl({ info, zoom = 1, stateOverride }: PetSpriteProps) {
     let drawnFrame = -1
     let drawnRow = -1
 
-    const rowIndex = (s: string) => {
-      const idx = rows.indexOf(s)
-
-      return idx >= 0 ? idx : 0
+    const rowIndexForState = (s: PetState): number => {
+      for (const key of STATE_ALIASES[s] ?? [s]) {
+        const idx = rows.indexOf(key)
+        if (idx >= 0) {
+          return idx
+        }
+      }
+      return 0
     }
 
     // Resolve a state to the row it draws and its real frame count. A state
@@ -105,14 +152,22 @@ function PetSpriteImpl({ info, zoom = 1, stateOverride }: PetSpriteProps) {
       const real = framesByState?.[s] ?? frames
 
       if (real > 0) {
-        return { row: rowIndex(s), count: real }
+        return { row: rowIndexForState(s), count: real }
       }
 
-      return { row: rowIndex('idle'), count: Math.max(1, framesByState?.idle ?? frames) }
+      return { row: rowIndexForState('idle'), count: Math.max(1, framesByState?.idle ?? frames) }
+    }
+
+    const resolveRow = (rowName: string): { row: number; count: number } => {
+      const row = rows.indexOf(rowName)
+      const state = ROW_TO_STATE[rowName]
+      const count = Math.max(1, framesByState?.[rowName] ?? (state ? framesByState?.[state] : 0) ?? frames)
+      return { row: row >= 0 ? row : rowIndexForState(state ?? 'idle'), count }
     }
 
     const render = (now: number) => {
-      const { row, count } = resolve(overrideRef.current ?? stateRef.current)
+      const forcedRow = rowOverrideRef.current
+      const { row, count } = forcedRow ? resolveRow(forcedRow) : resolve(overrideRef.current ?? stateRef.current)
       // Per-state step keeps every state's loop ~loopMs even when frame counts
       // differ; counts vary per row so derive the cadence here, not once.
       const stepMs = loopMs / count

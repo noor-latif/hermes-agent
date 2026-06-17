@@ -675,7 +675,12 @@ export function CommandPalette() {
                 if (page === 'generate-pet' && event.key === 'Enter' && search.trim()) {
                   const genStatus = $petGenStatus.get()
 
-                  if (genStatus !== 'generating' && genStatus !== 'hatching') {
+                  if (
+                    genStatus !== 'generating' &&
+                    genStatus !== 'hatching' &&
+                    genStatus !== 'preview' &&
+                    genStatus !== 'adopting'
+                  ) {
                     event.preventDefault()
                     void generateDrafts(requestGateway, { prompt: search })
                   }

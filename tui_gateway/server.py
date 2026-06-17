@@ -5050,8 +5050,29 @@ def _pet_sprite_payload(pet, *, scale: float) -> dict:
         "framesByState": _pet_frame_counts(pet.spritesheet),
         "loopMs": constants.LOOP_MS,
         "scale": scale,
-        "stateRows": list(constants.STATE_ROWS),
+        "stateRows": _pet_state_rows(pet.spritesheet),
     }
+
+
+def _pet_state_rows(spritesheet) -> list[str]:
+    """Row taxonomy for the concrete active pet sheet.
+
+    Hermes has to support both the legacy 8-row petdex atlas and the current
+    Codex/petdex 9-row atlas. The desktop canvas gets this list and indexes it
+    with the same `PetState` names the Python renderer uses.
+    """
+    try:
+        from PIL import Image
+
+        from agent.pet import constants
+
+        with Image.open(spritesheet) as image:
+            row_count = max(1, image.height // constants.FRAME_H)
+        return list(constants.state_rows_for_grid(row_count))
+    except Exception:  # noqa: BLE001 - cosmetic, never break the surface
+        from agent.pet import constants
+
+        return list(constants.STATE_ROWS)
 
 
 @method("pet.info")

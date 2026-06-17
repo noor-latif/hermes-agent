@@ -56,13 +56,13 @@ def derive_pet_state(
     1. ``error``          → ``FAILED``  (a tool/turn just failed)
     2. ``celebrate``      → ``JUMP``    (explicit success beat, e.g. todos done)
     3. ``just_completed`` → ``WAVE``    (turn finished cleanly / greeting)
-    4. ``tool_running``   → ``RUN``     (a tool is executing)
-    5. ``reasoning``      → ``REVIEW``  (model is thinking / reading)
-    6. ``busy``           → ``RUN``     (turn in flight, unspecified work)
-    7. otherwise          → ``IDLE``    (incl. ``awaiting_input``)
-
-    ``awaiting_input`` is accepted for symmetry with the surfaces but maps to
-    ``IDLE`` — a pet waiting on the user should rest, not run.
+    4. ``awaiting_input`` → ``WAITING`` (blocked on the user — a clarify/approval
+       prompt is open; this outranks the in-flight signals below because the turn
+       is paused on *you*, even though a tool is technically mid-call)
+    5. ``tool_running``   → ``RUN``     (a tool is executing)
+    6. ``reasoning``      → ``REVIEW``  (model is thinking / reading)
+    7. ``busy``           → ``RUN``     (turn in flight, unspecified work)
+    8. otherwise          → ``IDLE``
     """
     if error:
         return PetState.FAILED
@@ -70,6 +70,8 @@ def derive_pet_state(
         return PetState.JUMP
     if just_completed:
         return PetState.WAVE
+    if awaiting_input:
+        return PetState.WAITING
     if tool_running:
         return PetState.RUN
     if reasoning:

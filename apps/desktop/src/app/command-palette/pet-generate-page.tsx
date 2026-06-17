@@ -17,7 +17,7 @@ import { triggerHaptic } from '@/lib/haptics'
 import { Check, Egg, Loader2, PawPrint, RefreshCw } from '@/lib/icons'
 import { cn } from '@/lib/utils'
 import { closeCommandPalette } from '@/store/command-palette'
-import { type PetInfo, type PetState } from '@/store/pet'
+import { type PetInfo } from '@/store/pet'
 import {
   $petGenDrafts,
   $petGenError,
@@ -36,9 +36,30 @@ const VARIANT_COUNT = 4
 // the user's configured `display.pet.scale`.
 const PREVIEW_SCALE = 0.7
 
-// States the preview cycles through so the user sees every animation row.
-const PREVIEW_STATES: PetState[] = ['idle', 'wave', 'run', 'review', 'jump', 'failed']
+// Fallback row order if a backend doesn't return `stateRows`.
+const PREVIEW_ROWS = ['idle', 'waving', 'running-right', 'running-left', 'running', 'review', 'jumping', 'failed']
 const PREVIEW_STATE_MS = 1500
+
+const ROW_TO_FRAME_KEY: Record<string, string> = {
+  idle: 'idle',
+  wave: 'wave',
+  waving: 'wave',
+  jump: 'jump',
+  jumping: 'jump',
+  run: 'run',
+  running: 'run',
+  'running-right': 'run',
+  'running-left': 'run',
+  failed: 'failed',
+  review: 'review',
+  waiting: 'waiting'
+}
+
+function frameCountForRow(pet: PetInfo, row: string): number {
+  const byState = pet.framesByState
+  const mapped = ROW_TO_FRAME_KEY[row]
+  return byState?.[row] ?? (mapped ? byState?.[mapped] : undefined) ?? pet.framesPerState ?? 0
+}
 
 interface PetGeneratePageProps {
   search: string
@@ -212,22 +233,29 @@ function HatchPreview({ pet, adopting, error, onAdopt, onDiscard }: HatchPreview
   const { t } = useI18n()
   const copy = t.commandCenter.generatePet
   const [stateIndex, setStateIndex] = useState(0)
+  const previewRows = (pet.stateRows?.length ? pet.stateRows : PREVIEW_ROWS).filter(row => frameCountForRow(pet, row) > 0)
+  const rows = previewRows.length > 0 ? previewRows : ['idle']
+  const activeRow = rows[stateIndex % rows.length] ?? 'idle'
 
   // Cycle through the animation rows so the preview showcases all frames.
   useEffect(() => {
     const id = setInterval(() => {
-      setStateIndex(i => (i + 1) % PREVIEW_STATES.length)
+      setStateIndex(i => (i + 1) % rows.length)
     }, PREVIEW_STATE_MS)
 
     return () => clearInterval(id)
-  }, [])
+  }, [rows.length])
+
+  useEffect(() => {
+    setStateIndex(0)
+  }, [pet.slug])
 
   const previewInfo: PetInfo = { ...pet, scale: PREVIEW_SCALE }
 
   return (
     <div className="flex flex-col items-center gap-2 p-2">
       <div className="flex min-h-[9rem] w-full items-center justify-center rounded-lg border border-(--ui-stroke-tertiary) bg-(--ui-bg-quinary) py-2">
-        <PetSprite info={previewInfo} stateOverride={PREVIEW_STATES[stateIndex]} />
+        <PetSprite info={previewInfo} rowOverride={activeRow} />
       </div>
 
       {pet.displayName && <p className="text-xs font-medium text-foreground">{pet.displayName}</p>}

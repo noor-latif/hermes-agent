@@ -37,6 +37,8 @@ export type PetGenStatus =
 export const $petGenStatus = atom<PetGenStatus>('idle')
 export const $petGenError = atom<string | null>(null)
 export const $petGenToken = atom<string | null>(null)
+/** Prompt that produced the current draft token; hatch uses this for consistency. */
+export const $petGenPrompt = atom<string>('')
 export const $petGenDrafts = atom<PetDraft[]>([])
 export const $petGenSelected = atom<number | null>(null)
 /** The hatched-but-unadopted pet: its renderer payload, played in the preview. */
@@ -53,6 +55,7 @@ export function resetPetGen(): void {
   $petGenStatus.set('idle')
   $petGenError.set(null)
   $petGenToken.set(null)
+  $petGenPrompt.set('')
   $petGenDrafts.set([])
   $petGenSelected.set(null)
   $petGenPreview.set(null)
@@ -86,8 +89,15 @@ export async function generateDrafts(request: GatewayRequest, options: GenerateO
     return false
   }
 
+  // Starting a fresh generation round supersedes any unadopted preview pet.
+  const preview = $petGenPreview.get()
+  if (preview?.slug) {
+    await request('pet.remove', { slug: preview.slug }).catch(() => {})
+  }
+
   $petGenStatus.set('generating')
   $petGenError.set(null)
+  $petGenPreview.set(null)
   $petGenDrafts.set([])
   $petGenSelected.set(null)
 
@@ -103,6 +113,7 @@ export async function generateDrafts(request: GatewayRequest, options: GenerateO
     }
 
     $petGenToken.set(result.token)
+    $petGenPrompt.set(prompt)
     $petGenDrafts.set(result.drafts)
     $petGenSelected.set(result.drafts[0]?.index ?? 0)
     $petGenStatus.set('ready')
@@ -137,6 +148,7 @@ export async function hatchSelected(request: GatewayRequest, options: HatchOptio
   const token = $petGenToken.get()
   const index = $petGenSelected.get()
   const name = options.name.trim()
+  const concept = ($petGenPrompt.get() || options.prompt || name).trim()
 
   if (token === null || index === null || !name) {
     return false
@@ -151,7 +163,7 @@ export async function hatchSelected(request: GatewayRequest, options: HatchOptio
       index,
       name,
       description: options.description ?? '',
-      prompt: options.prompt ?? name,
+      prompt: concept,
       style: options.style ?? 'auto'
     })
 
