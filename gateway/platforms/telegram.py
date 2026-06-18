@@ -27,6 +27,10 @@ try:
         from telegram import LinkPreviewOptions
     except ImportError:
         LinkPreviewOptions = None
+    try:
+        from telegram import ForceReply
+    except ImportError:
+        ForceReply = None
     from telegram.ext import (
         Application,
         CommandHandler,
@@ -46,6 +50,7 @@ except ImportError:
     InlineKeyboardButton = Any
     InlineKeyboardMarkup = Any
     LinkPreviewOptions = None
+    ForceReply = Any
     Application = Any
     CommandHandler = Any
     CallbackQueryHandler = Any
@@ -135,6 +140,10 @@ def check_telegram_requirements() -> bool:
             from telegram import LinkPreviewOptions as _LPO
         except ImportError:
             _LPO = None
+        try:
+            from telegram import ForceReply as _FR
+        except ImportError:
+            _FR = None
         from telegram.ext import (
             Application as _App, CommandHandler as _CH,
             CallbackQueryHandler as _CQH,
@@ -151,6 +160,7 @@ def check_telegram_requirements() -> bool:
     InlineKeyboardButton = _IKB
     InlineKeyboardMarkup = _IKM
     LinkPreviewOptions = _LPO
+    ForceReply = _FR
     Application = _App
     CommandHandler = _CH
     CallbackQueryHandler = _CQH
@@ -472,6 +482,12 @@ class TelegramAdapter(BasePlatformAdapter):
         self._send_path_degraded: bool = False
         # DM Topics: map of topic_name -> message_thread_id (populated at startup)
         self._dm_topics: Dict[str, int] = {}
+        # Kanban review-prompt reply routing: (chat_id, prompt_message_id) ->
+        # {"task_id": ..., "board_slug": ...}. Populated when the user taps
+        # "Reply & unblock" on a blocked-task ping; consumed by the reply
+        # router in _handle_text_message when the user's next text message
+        # arrives as a reply to the prompt message.
+        self._kanban_reply_targets: Dict[tuple, Dict[str, str]] = {}
         # Track forum chats where we've already registered bot commands
         self._forum_command_registered: set[int] = set()
         # Lock per la registrazione sicura dei comandi nei forum supergroup
@@ -3207,6 +3223,61 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.warning("[%s] send_update_prompt failed: %s", self.name, e)
             return SendResult(success=False, error=str(e))
 
+    async def send_kanban_blocked_prompt(
+        self,
+        chat_id: str,
+        text: str,
+        task_id: str,
+        board_slug: str = "",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send a kanban-blocked notification with Approve / Reply & unblock buttons.
+
+        Used by the kanban notifier when a worker self-blocks with
+        ``review-required:`` reason. Each button is bound to the specific
+        ``task_id`` and ``board_slug`` via ``callback_data`` (Telegram's 64-byte
+        limit is fine: ``kbapprove:<board>:<task>`` is ~40 bytes). The buttons
+        stay on the message until the user taps one — then the callback handler
+        edits the message to remove buttons and show the result.
+        """
+        if not self._bot:
+            return SendResult(success=False, error="Not connected")
+        # Embed board + task id in callback_data so the handler can route
+        # to the right per-board DB without ambiguity on multi-board installs.
+        # Format: "kb<verb>:<board>:<task_id>". The board segment is optional
+        # in the data path (handler falls back to the current board) but
+        # always present in what we send.
+        cb_approve = f"kbapprove:{board_slug}:{task_id}"
+        cb_reply = f"kbreply:{board_slug}:{task_id}"
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ Approve", callback_data=cb_approve),
+                InlineKeyboardButton("✏️ Reply & unblock", callback_data=cb_reply),
+            ]
+        ])
+        try:
+            thread_id = self._metadata_thread_id(metadata)
+            reply_to_id = self._reply_to_message_id_for_send(None, metadata, reply_to_mode=self._reply_to_mode)
+            msg = await self._send_message_with_thread_fallback(
+                chat_id=int(chat_id),
+                text=self.format_message(text),
+                parse_mode=ParseMode.MARKDOWN_V2,
+                reply_markup=keyboard,
+                reply_to_message_id=reply_to_id,
+                **self._thread_kwargs_for_send(
+                    chat_id,
+                    thread_id,
+                    metadata,
+                    reply_to_message_id=reply_to_id,
+                    reply_to_mode=self._reply_to_mode
+                ),
+                **self._link_preview_kwargs(),
+            )
+            return SendResult(success=True, message_id=str(msg.message_id))
+        except Exception as e:
+            logger.warning("[%s] send_kanban_blocked_prompt failed: %s", self.name, e)
+            return SendResult(success=False, error=str(e))
+
     async def send_exec_approval(
         self, chat_id: str, command: str, session_key: str,
         description: str = "dangerous command",
@@ -3907,6 +3978,16 @@ class TelegramAdapter(BasePlatformAdapter):
             )
             return
 
+        # --- Kanban review-prompt callbacks (kbapprove: / kbreply:) ---
+        if data.startswith(("kbapprove:", "kbreply:")):
+            await self._handle_kanban_review_callback(
+                query, data,
+                query_chat_id=query_chat_id,
+                query_thread_id=query_thread_id,
+                query_user_name=query_user_name,
+            )
+            return
+
         # --- Exec approval callbacks (ea:choice:id) ---
         if data.startswith("ea:"):
             parts = data.split(":", 2)
@@ -4240,6 +4321,224 @@ class TelegramAdapter(BasePlatformAdapter):
         "vip":          ("vip-add.sh",         ["email"],  "✓ marked VIP",         True),
         "vip-domain":   ("vip-add.sh",         ["domain"], "✓ marked VIP domain",  True),
     }
+
+    async def _handle_kanban_review_callback(
+        self,
+        query,
+        data: str,
+        *,
+        query_chat_id,
+        query_thread_id,
+        query_user_name,
+    ) -> None:
+        """Handle Approve / Reply & unblock button taps from kanban-blocked pings.
+
+        ``data`` has the form ``kbapprove:<board>:<task_id>`` or
+        ``kbreply:<board>:<task_id>``. On tap, we:
+          1. authorize the caller against the platform allowlist
+          2. answer the callback with a short label (so Telegram dismisses the
+             "loading" spinner and shows confirmation on the tap)
+          3. edit the original message to remove buttons + show the result
+          4. for ``kbreply``: post a "Type your reply" follow-up message with
+             ``ForceReply`` so the user's next text becomes a kanban comment +
+             unblock without them typing the task id
+          5. for ``kbapprove``: post a kanban comment "approved by operator",
+             mark the task done, dispatch immediately
+        """
+        verb, board_slug, task_id = self._parse_kanban_callback_data(data)
+        if not task_id:
+            await query.answer(text="Invalid button data.")
+            return
+
+        # Authz — same check the other callback handlers use, so a stranger
+        # who finds the bot can't approve things on your behalf.
+        caller_id = str(getattr(query.from_user, "id", ""))
+        if not self._is_callback_user_authorized(
+            caller_id,
+            chat_id=query_chat_id,
+            chat_type=str(getattr(query.message.chat.type, "value", query.message.chat.type))
+            if getattr(query, "message", None) and getattr(query.message, "chat", None)
+            else None,
+            thread_id=str(query_thread_id) if query_thread_id is not None else None,
+            user_name=query_user_name,
+        ):
+            await query.answer(text="⛔ You are not authorized to review this task.")
+            return
+
+        # Answer the callback to dismiss Telegram's "loading" indicator.
+        if verb == "kbapprove":
+            await query.answer(text="✅ Approving...")
+        else:  # kbreply
+            await query.answer(text="✏️ Awaiting your reply...")
+
+        # Resolve which board's DB to talk to. Falls back to current board
+        # if the callback data was missing the segment.
+        from hermes_cli import kanban_db as _kb
+        try:
+            from hermes_cli.kanban_boards import get_current_board as _gcb
+            resolved_board = board_slug or _gcb()
+        except Exception:
+            resolved_board = board_slug or ""
+
+        if verb == "kbapprove":
+            await self._do_kanban_approve(
+                query, task_id, resolved_board, query_chat_id,
+                query_thread_id=query_thread_id,
+                query_user_name=query_user_name,
+            )
+        else:  # kbreply
+            await self._open_kanban_reply_prompt(
+                query, task_id, resolved_board, query_chat_id,
+                query_thread_id=query_thread_id,
+            )
+
+    @staticmethod
+    def _parse_kanban_callback_data(data: str):
+        """Parse ``kb<verb>:<board>:<task_id>``. Returns (verb, board, task_id)."""
+        # data is "kbapprove:<board>:<task_id>" or "kbreply:<board>:<task_id>"
+        if ":" not in data:
+            return data, "", ""
+        parts = data.split(":", 2)
+        verb = parts[0]
+        board = parts[1] if len(parts) > 1 else ""
+        task = parts[2] if len(parts) > 2 else ""
+        return verb, board, task
+
+    async def _do_kanban_approve(
+        self,
+        query,
+        task_id: str,
+        board_slug: str,
+        query_chat_id,
+        *,
+        query_thread_id,
+        query_user_name,
+    ) -> None:
+        """Approve a blocked task: post a comment, mark done, dispatch now."""
+        from hermes_cli import kanban_db as _kb
+        actor = (query_user_name or "operator").strip() or "operator"
+        ok = False
+        err: str = ""
+        try:
+            with _kb.connect_closing() as conn:
+                _kb.add_comment(
+                    conn, task_id, actor,
+                    f"Approved by operator via Telegram button (board: {board_slug or 'current'})",
+                )
+                # complete_task returns bool but doesn't tell us the new
+                # status. Either way, the task is moving out of blocked.
+                ok = bool(_kb.complete_task(conn, task_id, summary="Approved via Telegram", result="ok"))
+        except Exception as exc:
+            err = str(exc)
+
+        # Edit the original message: remove buttons, show result.
+        if ok:
+            new_text = f"✅ Approved by {actor}. Task {task_id} done. Dispatcher will pick up the next stage."
+        else:
+            new_text = f"⚠️ Approve failed for {task_id}: {err or 'unknown error'}"
+        try:
+            await query.edit_message_text(
+                text=self.format_message(new_text),
+                parse_mode=ParseMode.MARKDOWN_V2,
+                reply_markup=None,
+            )
+        except Exception:
+            pass  # non-fatal
+
+        # Trigger an immediate dispatch so the worker's successors (verifier
+        # / synthesizer) don't have to wait for the 60s tick. This mirrors
+        # the dashboard's "Reply & unblock" banner behavior in PR #43216.
+        if ok:
+            try:
+                import asyncio as _asyncio
+                from hermes_cli import kanban as _kanban_cli
+                _asyncio.get_event_loop().run_in_executor(
+                    None, lambda: _kanban_cli.run_slash("dispatch"),
+                )
+            except Exception as exc:
+                logger.debug("post-approve dispatch hook failed (non-fatal): %s", exc)
+
+    async def _open_kanban_reply_prompt(
+        self,
+        query,
+        task_id: str,
+        board_slug: str,
+        query_chat_id,
+        *,
+        query_thread_id,
+    ) -> None:
+        """Open a ForceReply prompt bound to (chat_id, task_id).
+
+        The user's next text message — whose ``reply_to_message`` will be
+        the prompt message we just sent — is captured by the
+        ``_kanban_reply_router`` registered at adapter init and routed to
+        ``kanban_comment`` + ``kanban_unblock`` automatically. No task id
+        typing required.
+        """
+        if ForceReply is None:
+            # Library missing ForceReply — degrade to plain message asking
+            # the user to type `/kanban unblock <id> <reply>` themselves.
+            fallback = (
+                f"Reply with: `/kanban reply-and-unblock {task_id} <your feedback>`"
+            )
+            try:
+                await self._bot.send_message(
+                    chat_id=int(query_chat_id), text=fallback,
+                )
+            except Exception:
+                pass
+            try:
+                await query.edit_message_text(
+                    text=self.format_message(
+                        f"✏️ Reply needed for {task_id}. Type your feedback as a reply to the next message."
+                    ),
+                    parse_mode=ParseMode.MARKDOWN_V2,
+                    reply_markup=None,
+                )
+            except Exception:
+                pass
+            return
+
+        # Edit the original message to remove buttons (mirrors the Approve path).
+        try:
+            await query.edit_message_text(
+                text=self.format_message(
+                    f"✏️ Awaiting your reply for {task_id}. Tap Reply on the next message and type your feedback — the task will be unblocked automatically."
+                ),
+                parse_mode=ParseMode.MARKDOWN_V2,
+                reply_markup=None,
+            )
+        except Exception:
+            pass
+
+        # Send a "Type your reply" prompt with ForceReply. selective=True
+        # means the force-reply only applies to this specific message, not
+        # to every subsequent bot message in the chat.
+        prompt_text = f"💬 Type your reply for {task_id}:"
+        prompt_markup = ForceReply(selective=True, input_field_placeholder="your feedback…")
+        try:
+            sent = await self._bot.send_message(
+                chat_id=int(query_chat_id),
+                text=prompt_text,
+                reply_markup=prompt_markup,
+                reply_to_message_id=query.message.message_id,
+            )
+        except Exception as exc:
+            logger.warning("Failed to send ForceReply prompt: %s", exc)
+            return
+
+        # Register the routing target. The reply router looks up (chat_id,
+        # prompt_message_id) → (board, task_id) and triggers comment+unblock
+        # when the user replies.
+        from hermes_cli import kanban_db as _kb  # noqa: F401
+        self._kanban_reply_targets[(int(query_chat_id), int(sent.message_id))] = {
+            "task_id": task_id,
+            "board_slug": board_slug,
+        }
+        logger.info(
+            "kanban reply prompt sent: chat=%s prompt_msg=%s task=%s",
+            query_chat_id, sent.message_id, task_id,
+        )
 
     async def _handle_gmail_triage_callback(
         self,
@@ -5907,6 +6206,14 @@ class TelegramAdapter(BasePlatformAdapter):
         msg = self._effective_update_message(update)
         if not msg or not msg.text:
             return
+
+        # Kanban reply-prompt router: if the user is replying to one of our
+        # ForceReply prompts (set up when they tapped "Reply & unblock" on
+        # a blocked-task ping), capture the text as a kanban comment +
+        # unblock the task automatically. No task id typing required.
+        if await self._try_route_kanban_reply(msg):
+            return
+
         if not self._should_process_message(msg):
             if self._should_observe_unmentioned_group_message(msg):
                 self._observe_unmentioned_group_message(msg, MessageType.TEXT, update_id=update.update_id)
@@ -5918,6 +6225,76 @@ class TelegramAdapter(BasePlatformAdapter):
         await self._cache_replied_media(msg, event)
         event = self._apply_telegram_group_observe_attribution(event)
         self._enqueue_text_event(event)
+
+    async def _try_route_kanban_reply(self, msg) -> bool:
+        """If ``msg`` is a reply to a kanban review-prompt, route the text
+        to ``kanban_comment`` + ``kanban_unblock`` automatically. Returns
+        True when the message was consumed (caller should stop further
+        processing); False when no routing target matched.
+        """
+        reply_to = getattr(msg, "reply_to_message", None)
+        if reply_to is None:
+            return False
+        # Only route when the reply target is one of OUR prompt messages
+        # (from_user.id == self._bot.id). Otherwise it's a regular reply
+        # to some other message and the normal text flow should handle it.
+        bot_id = getattr(self._bot, "id", None) if self._bot else None
+        if bot_id is not None:
+            from_user = getattr(reply_to, "from_user", None)
+            if from_user is None or getattr(from_user, "id", None) != bot_id:
+                return False
+
+        chat_id = getattr(msg, "chat_id", None)
+        prompt_msg_id = getattr(reply_to, "message_id", None)
+        if chat_id is None or prompt_msg_id is None:
+            return False
+        key = (int(chat_id), int(prompt_msg_id))
+        target = self._kanban_reply_targets.pop(key, None)
+        if not target:
+            return False  # We sent the prompt but it's been consumed or expired.
+
+        task_id = target.get("task_id", "")
+        board_slug = target.get("board_slug", "")
+        reply_text = (msg.text or "").strip()
+        if not reply_text:
+            # Empty reply: send a hint and re-prompt instead of doing the
+            # destructive action. The user can type something and try again.
+            try:
+                await self._bot.send_message(
+                    chat_id=int(chat_id),
+                    text=f"Empty reply — type your feedback for {task_id} and try again.",
+                )
+            except Exception:
+                pass
+            return True  # consumed; we handled it (with a hint)
+
+        # Fire kanban_comment + kanban_unblock. Run synchronously so the
+        # unblock lands before the dispatcher tick the user is implicitly
+        # racing against.
+        from hermes_cli import kanban_db as _kb
+        try:
+            with _kb.connect_closing() as conn:
+                _kb.add_comment(conn, task_id, "operator", reply_text)
+                _kb.unblock_task(conn, task_id)
+        except Exception as exc:
+            try:
+                await self._bot.send_message(
+                    chat_id=int(chat_id),
+                    text=f"⚠️ Failed to apply reply to {task_id}: {exc}",
+                )
+            except Exception:
+                pass
+            return True
+
+        # Confirm in chat. Acknowledge the reply and the unblock.
+        try:
+            await self._bot.send_message(
+                chat_id=int(chat_id),
+                text=f"↩ Replied to {task_id}: {reply_text[:200]}\nTask unblocked. Worker will respawn on the next dispatch tick (≤60s).",
+            )
+        except Exception:
+            pass
+        return True
 
     async def _handle_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming command messages."""

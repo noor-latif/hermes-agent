@@ -300,9 +300,27 @@ class GatewayKanbanWatchersMixin:
                             sub["chat_id"], sub.get("thread_id") or "",
                         )
                         try:
-                            await adapter.send(
-                                sub["chat_id"], msg, metadata=metadata,
-                            )
+                            # Blocked events get inline Approve / Reply &
+                            # unblock buttons. Other terminal events (done,
+                            # gave_up, crashed, timed_out) stay plain text.
+                            if kind == "blocked" and hasattr(adapter, "send_kanban_blocked_prompt"):
+                                send_result = await adapter.send_kanban_blocked_prompt(
+                                    sub["chat_id"], msg,
+                                    task_id=sub["task_id"],
+                                    board_slug=board_slug or "",
+                                    metadata=metadata,
+                                )
+                                if not send_result.success:
+                                    # Fall back to plain text so the user
+                                    # still gets notified even if the
+                                    # inline-keyboard path fails.
+                                    await adapter.send(
+                                        sub["chat_id"], msg, metadata=metadata,
+                                    )
+                            else:
+                                await adapter.send(
+                                    sub["chat_id"], msg, metadata=metadata,
+                                )
                             logger.debug(
                                 "kanban notifier: delivered %s event for %s to %s/%s on board %s",
                                 kind, sub["task_id"], platform_str, sub["chat_id"], board_slug,
