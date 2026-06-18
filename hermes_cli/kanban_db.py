@@ -216,6 +216,16 @@ _CTX_MAX_COMMENTS       = 30      # most recent N comments shown in full
 _CTX_MAX_FIELD_BYTES    = 4 * 1024   # 4 KB per summary/error/metadata/result
 _CTX_MAX_BODY_BYTES     = 8 * 1024   # 8 KB per task.body (opening post)
 _CTX_MAX_COMMENT_BYTES  = 2 * 1024   # 2 KB per comment
+# Smart-summary threshold: when a parent task's summary exceeds this many
+# bytes, we ask the cheap auxiliary LLM to condense it (preserve key
+# facts/decisions/errors) before injecting into the child worker's
+# context. Below this, the raw text fits comfortably and summarization
+# would just add latency for no gain. Tuned to be ~2x the per-field cap
+# / 2 — short enough that summarization is genuinely additive, long
+# enough that we don't fire on every moderately-sized summary.
+_CTX_SUMMARIZE_THRESHOLD_BYTES = 2 * 1024   # 2 KB
+_CTX_SUMMARIZE_MAX_OUTPUT_BYTES = 1500       # Cap returned summary to ~1.5 KB
+_CTX_SUMMARIZE_TIMEOUT_SECONDS = 8           # Hard cap on the LLM call
 
 
 # ---------------------------------------------------------------------------
@@ -2049,6 +2059,207 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+# -----------------------------------------------------------------------
+# Gated iteration: max_iterations_per_root
+# -----------------------------------------------------------------------
+#
+# Background: in the Athar 2026-06-18 battle, the auto-orchestrator ran
+# a runaway loop (v2 → v3 → v4 → v5 → v6 → v7 in 50 seconds) because
+# each completed vN synthesised a v(N+1) and the auto_decompose +
+# kanban-orchestrator skill created the next seed card automatically.
+# The user's actual preference (verbatim): "I don't mind the automatic
+# goal iterations. I was just hoping the first iteration would wait for
+# my review on the blocked items before trying to iterate more."
+#
+# Soft fix (Phase 2.9) added a system-prompt rule telling the worker
+# to stop spawning iterations when a sibling is `blocked` for review.
+# That fix is in agent/prompt_builder.py:KANBAN_GUIDANCE and is enforced
+# by the model. This is the **hard** fix: dispatch-level enforcement
+# at task creation. A worker that ignores the soft rule still cannot
+# create iteration N+1 if the cap says so.
+#
+# Config: kanban.max_iterations_per_root (default 3). Set to 0 to
+# disable. See hermes_cli/config.py for the full doc comment.
+#
+# Algorithm:
+#   1. Compute the "goal root" of the new title by stripping a trailing
+#      version token (v1/v2/2/3/part-2/iteration-2). The remaining
+#      first 4 lowercased word-tokens are the root.
+#   2. Count non-archived tasks on the same board whose normalised
+#      title has the same root.
+#   3. If count >= max_iterations_per_root AND the new task would
+#      otherwise land in `ready`/`todo`/`running`, demote to `triage`
+#      and append a system note explaining the gate. The task is not
+#      blocked from being created — the user can promote it with
+#      `hermes kanban promote <id>` when they want iteration N+1.
+#   4. An explicit `triage=True` from the caller is respected
+#      unconditionally (the caller already declared triage intent).
+#   5. If the title has no recognisable root (empty, single short word
+#      with no version), the gate does not apply — the prefix would
+#      over-match (e.g. "Deploy", "Test", "Build" all share the root
+#      "deploy/test/build" and we don't want to gate every task with
+#      a one-word title). Threshold: at least 2 tokens after stripping
+#      the version suffix.
+
+_VERSION_TOKEN_RE = re.compile(
+    r"""(?ix)
+    # Strip a leading version token ("Iteration 4: rebuild")
+    ^ (?:v|iteration|iter|part|rev|version) \s* \d+ \s* [-—–:|,/]? \s*
+    |
+    # Strip a parenthetical version ("Build Athar (v2)")
+    \( \s* (?:v|iteration|iter|part|rev|version)? \s* \d+ \s* \) \s*
+    |
+    # Strip a trailing version with optional leading separator
+    (?: \s* [-—–:|,/] \s* | \s+ )?
+    (?:
+        v \d+                          # v1, v2, v23
+      | iteration \s* \d+              # iteration 2
+      | iter \s* \d+                   # iter 2
+      | part \s* \d+                   # part 2
+      | rev \s* \d+                    # rev 2
+      | version \s* \d+                # version 2
+      | (?: \d+ )                      # 2, 23
+    )
+    \s* $
+    """
+)
+
+
+def _goal_root(title: str) -> Optional[str]:
+    """Return the goal-prefix of a task title, or ``None`` if not enough signal.
+
+    "Build Athar"        -> "build athar"
+    "Build Athar v2"     -> "build athar"
+    "Build Athar — v3"   -> "build athar"
+    "Build Athar (v2)"   -> "build athar"
+    "Ship feature"       -> "ship feature"
+    "Iteration 4: rebuild" -> "rebuild"
+    "v2 alone"           -> None   (whole title is a version token)
+    "Refine"             -> None   (single token, would over-match)
+    ""                   -> None
+    """
+    if not title:
+        return None
+    s = title.strip()
+    if not s:
+        return None
+    # Strip leading and trailing version tokens (and any leading/trailing
+    # separator or parenthetical wrapper).
+    s = _VERSION_TOKEN_RE.sub("", s).strip()
+    if not s:
+        return None
+    # Tokenise on any non-alphanumeric boundary. This handles
+    # "Build.Athar—v9" -> ["build", "athar", "v9"] correctly (v9
+    # then gets stripped by the previous regex round on the next
+    # call, but for first-pass we just want clean tokens).
+    tokens = re.findall(r"[A-Za-z0-9]+", s.lower())
+    if not tokens:
+        return None
+    # Need at least 2 tokens to make a discriminating prefix. One-word
+    # titles like "Deploy" or "Test" would over-match every other task.
+    if len(tokens) < 2:
+        return None
+    # Cap at the first 4 content tokens. "Build Athar find-my-device
+    # web prototype end-to-end Go backend with..." should root on
+    # "build athar find-my-device web", not the whole sentence.
+    return " ".join(tokens[:4])
+
+
+def _root2(title: str) -> Optional[str]:
+    """Cheap 2-token goal root for similarity matching.
+
+    Returns the lowercased first 2 alphanumeric tokens after
+    version-stripping, or ``None`` if the title has fewer than 2
+    tokens. Used by :func:`_count_same_root_tasks` for matching
+    existing titles — cheaper than re-running :func:`_goal_root`'s
+    full 4-token analysis, and accurate enough for the gate.
+
+    "Build Athar v1"          -> "build athar"
+    "Build Athar v99 (test)"  -> "build athar"
+    "Ship a thing"            -> "ship a"
+    "Refine"                  -> None
+    """
+    if not title:
+        return None
+    s = _VERSION_TOKEN_RE.sub("", title).strip()
+    if not s:
+        return None
+    tokens = re.findall(r"[A-Za-z0-9]+", s.lower())
+    if len(tokens) < 2:
+        return None
+    return " ".join(tokens[:2])
+
+
+def _count_same_root_tasks(
+    conn: sqlite3.Connection, root2: Optional[str], board: Optional[str] = None
+) -> int:
+    """Count non-archived tasks in this connection's database whose
+    2-token goal root matches ``root2``.
+
+    We compare on the 2-token root (not the full 4-token root) because
+    the version-stripping is the only thing that makes "Build Athar
+    v1" and "Build Athar v99 (gate test)" match — they share the
+    same first 2 tokens but diverge after. The full 4-token root is
+    too strict for this.
+
+    Boards in Hermes are physically separate SQLite files (one DB per
+    board under ``<root>/kanban/boards/<slug>/``), so a connection
+    already implicitly scopes its queries to a single board.
+    """
+    if not root2:
+        return 0
+    # Pull every non-archived title; compute root2 in Python. This is
+    # O(N) per call but N is small (typical board < 10k tasks) and
+    # SQLite can't run our version-strip regex anyway.
+    rows = conn.execute(
+        "SELECT title FROM tasks WHERE status != 'archived'"
+    ).fetchall()
+    n = 0
+    for (title,) in rows:
+        if _root2(title) == root2:
+            n += 1
+    return n
+
+
+def _get_max_iterations_per_root() -> int:
+    """Read the configured cap. Returns 0 if config is unreachable or
+    the cap is explicitly disabled."""
+    try:
+        from hermes_cli.config import load_config
+        kanban_cfg = (load_config().get("kanban") or {})
+        raw = kanban_cfg.get("max_iterations_per_root", 3)
+        cap = int(raw)
+    except Exception:
+        return 3
+    return max(0, cap)
+
+
+def _apply_iteration_gate(
+    conn: sqlite3.Connection,
+    *,
+    title: str,
+    board: Optional[str],
+    cap: int,
+) -> tuple[bool, Optional[str], Optional[int]]:
+    """If the cap is exceeded for the new title's goal root, return
+    ``(True, root, count)``. Caller demotes status to triage and
+    prepends a system note to the body.
+
+    Returns ``(False, root, count)`` if the cap is not exceeded (caller
+    continues normally). Returns ``(False, None, None)`` if there is
+    no recognisable goal root for this title (gate does not apply).
+    """
+    if cap <= 0:
+        return False, None, None
+    root2 = _root2(title)
+    if root2 is None:
+        return False, None, None
+    count = _count_same_root_tasks(conn, root2, board)
+    if count >= cap:
+        return True, root2, count
+    return False, root2, count
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -2230,6 +2441,37 @@ def create_task(
                     if missing:
                         raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
 
+                # Gated iteration (max_iterations_per_root): if this new
+                # title would push the goal-root count past the cap, demote
+                # to triage so the user can promote it explicitly. Does not
+                # apply to tasks the caller already marked triage (their
+                # intent is already triage) nor to one-word titles whose
+                # root is too short to discriminate.
+                _gate_hit = False
+                _gate_root2 = None
+                _gate_count = 0
+                _gate_note = ""
+                _gate_hit, _gate_root2, _gate_count = _apply_iteration_gate(
+                    conn,
+                    title=title,
+                    board=board,
+                    cap=_get_max_iterations_per_root(),
+                )
+                if _gate_hit and task_status not in {"triage", "blocked"}:
+                    _gate_note = (
+                        f"\n\n---\n"
+                        f"_Gated by `kanban.max_iterations_per_root` "
+                        f"({_gate_count} existing task(s) share goal root "
+                        f"`{_gate_root2}`). This iteration landed in **triage**; "
+                        f"promote it with `hermes kanban promote {task_id}` "
+                        f"when you want it to run, or raise the cap in "
+                        f"`~/.hermes/config.yaml` (set to 0 to disable)._"
+                    )
+                    body = (body or "") + _gate_note
+                    task_status = "triage"
+                # NOTE: do NOT `del` _gate_* here — the iteration_gate
+                # event emitted after the INSERT block reads them.
+
                 conn.execute(
                     """
                     INSERT INTO tasks (
@@ -2280,6 +2522,23 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                     },
                 )
+                # If the task was demoted to triage by the iteration gate,
+                # emit a separate, queryable event so the audit trail
+                # distinguishes operator-parked tasks from gate-parked ones.
+                if _gate_hit and task_status == "triage":
+                    _append_event(
+                        conn,
+                        task_id,
+                        "iteration_gate",
+                        {
+                            "root": _gate_root2,
+                            "existing_count": _gate_count,
+                            "cap": _get_max_iterations_per_root(),
+                            "demoted_from": "ready_or_todo",
+                        },
+                    )
+                # All gate locals are now out of scope.
+                del _gate_hit, _gate_root2, _gate_count, _gate_note
             return task_id
         except sqlite3.IntegrityError:
             if attempt == 1:
@@ -6949,6 +7208,84 @@ def run_daemon(
 # Worker context builder (what a spawned worker sees)
 # ---------------------------------------------------------------------------
 
+def _summarize_parent_summary(raw: str, *, parent_id: str, child_id: str) -> Optional[str]:
+    """Condense a large parent summary via the cheap auxiliary LLM.
+
+    When a parent task's completion summary is long enough that injecting
+    the raw text would crowd out other context (see
+    ``_CTX_SUMMARIZE_THRESHOLD_BYTES``), this helper asks the configured
+    ``auxiliary.kanban_summary`` provider to produce a tight
+    facts-and-decisions recap. The result is what the child worker sees
+    instead of the raw text.
+
+    Graceful degradation: any failure (no provider, LLM error, timeout,
+    empty response) returns ``None`` and the caller falls back to the
+    normal ``_cap`` truncation. This function is a quality improvement,
+    never a hard dependency — the kanban keeps working if the LLM is down.
+
+    Args:
+        raw: The parent's full completion summary.
+        parent_id: Used in the system prompt so the LLM knows which task
+            the summary belongs to.
+        child_id: Used in the system prompt so the LLM knows who is
+            about to read the condensed output.
+
+    Returns:
+        The condensed summary, or ``None`` if summarization failed.
+    """
+    if not raw or len(raw) <= _CTX_SUMMARIZE_THRESHOLD_BYTES:
+        return None
+    # Lazy import to keep kanban_db hermetic and avoid circular imports
+    # at module load (auxiliary_client pulls in agent.runtime which
+    # can import kanban for board paths).
+    try:
+        from agent.auxiliary_client import call_llm
+    except Exception:
+        return None
+
+    system = (
+        "You condense long task-completion summaries from a parent task "
+        "into a tight, fact-preserving recap for a downstream child task. "
+        "Preserve: decisions made, key file paths / commands / errors, "
+        "concrete numbers, open questions. Drop: pleasantries, "
+        "redundant narration, status updates. Output plain text only, "
+        "no markdown, no preamble. Aim for ~1 KB."
+    )
+    user = (
+        f"Parent task id: {parent_id}\n"
+        f"Child task id:  {child_id}\n\n"
+        "Condense the following summary, preserving the facts a "
+        "downstream worker needs to act on it:\n\n"
+        f"---\n{raw}\n---"
+    )
+    try:
+        response = call_llm(
+            task="kanban_summary",
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            temperature=0.2,
+            max_tokens=int(_CTX_SUMMARIZE_MAX_OUTPUT_BYTES / 3),  # rough char→token
+            timeout=_CTX_SUMMARIZE_TIMEOUT_SECONDS,
+        )
+        text = (response.choices[0].message.content or "").strip()
+        if not text:
+            return None
+        # Defensive cap: if the model returned more than the requested
+        # ~1.5 KB, truncate with a visible marker. Never return more
+        # than the field cap, since that's the bound the rest of the
+        # context builder trusts.
+        if len(text) > _CTX_MAX_FIELD_BYTES:
+            text = text[:_CTX_MAX_FIELD_BYTES] + "… [truncated by summarizer]"
+        return text
+    except Exception:
+        # Any failure: silent fallback. The caller will use _cap()
+        # truncation on the raw text, so the child still gets *something*
+        # useful.
+        return None
+
+
 def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     """Return the full text a worker should read to understand its task.
 
@@ -7096,7 +7433,23 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
 
             body_lines: list[str] = []
             if run is not None and run.summary and run.summary.strip():
-                body_lines.append(_cap(run.summary))
+                # Smart-summary path: when the parent's summary is large,
+                # condense it via the cheap auxiliary LLM and mark it
+                # as summarized so the child knows the text was
+                # compressed (not raw). On any failure the helper
+                # returns None and we fall back to the existing
+                # truncation.
+                raw_summary = run.summary.strip()
+                condensed = _summarize_parent_summary(
+                    raw_summary, parent_id=pid, child_id=task_id
+                )
+                if condensed:
+                    body_lines.append(
+                        f"[smart-summarized from {len(raw_summary)} chars]"
+                    )
+                    body_lines.append(_cap(condensed))
+                else:
+                    body_lines.append(_cap(raw_summary))
             elif pt.result:
                 body_lines.append(_cap(pt.result))
             else:
