@@ -65,6 +65,12 @@ _SENSITIVE_BODY_KEYS = frozenset({
 # warning is logged at gateway and CLI startup so operators see the
 # downgrade — see `_log_redaction_status()` in gateway/run.py and cli.py.
 _REDACT_ENABLED = os.getenv("HERMES_REDACT_SECRETS", "true").lower() in {"1", "true", "yes", "on"}
+# When True, redact_sensitive_text() returns input unchanged for non-force
+# callers (tool results, terminal output). Real values pass through to
+# subprocesses and to the model. Display paths (send_message, log
+# formatter, context summary) MUST use redact_for_display() instead.
+# Matches upstream PR #16849. Default False = current behavior.
+_DISPLAY_REDACTION_ONLY = os.getenv("HERMES_DISPLAY_REDACTION_ONLY", "false").lower() in {"1", "true", "yes", "on"}
 
 # Known API key prefixes -- match the prefix + contiguous token chars
 _PREFIX_PATTERNS = [
@@ -138,9 +144,13 @@ _PRIVATE_KEY_RE = re.compile(
 )
 
 # Database connection strings: protocol://user:PASSWORD@host
-# Catches postgres, mysql, mongodb, redis, amqp URLs and redacts the password
+# Catches postgres, mysql, mongodb, redis, amqp URLs and redacts the password.
+# Also matches SQLAlchemy-style `dialect+driver://` schemes
+# (e.g. postgresql+psycopg://, mysql+pymysql://, mongodb+srv://) — PR #43940
+# added the `+driver` segment after the audit showed a gap with
+# `postgresql+psycopg://user:PASSWORD@host` (only bare `postgres://` was caught).
 _DB_CONNSTR_RE = re.compile(
-    r"((?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|amqp)://[^:]+:)([^@]+)(@)",
+    r"((?:postgres(?:ql)?(?:\+\w+)?|mysql(?:\+\w+)?|mongodb(?:\+srv)?(?:\+\w+)?|redis(?:\+\w+)?|amqp(?:\+\w+)?)://(?:[^:@]+)?:)([^@]+)(@)",
     re.IGNORECASE,
 )
 
@@ -354,6 +364,12 @@ def redact_sensitive_text(text: str, *, force: bool = False, code_file: bool = F
         return text
     if not (force or _REDACT_ENABLED):
         return text
+    # display_redaction_only: when force=False and display_redaction_only=True,
+    # skip redaction so real values pass through to subprocesses and the
+    # model. Chat-display contexts MUST use redact_for_display() instead.
+    # Matches upstream PR #16849.
+    if not force and _DISPLAY_REDACTION_ONLY:
+        return text
 
     # Known prefixes (sk-, ghp_, etc.) — gate on substring presence
     if _has_known_prefix_substring(text):
@@ -426,6 +442,24 @@ def redact_sensitive_text(text: str, *, force: bool = False, code_file: bool = F
         text = _SIGNAL_PHONE_RE.sub(_redact_phone, text)
 
     return text
+
+
+def redact_for_display(text, *, code_file: bool = False):
+    """Always-redact helper for chat/log/display paths.
+
+    Use this in:
+      - send_message (Telegram/Discord/Slack gateway)
+      - RedactingFormatter (logs)
+      - Context summarizer (compression)
+
+    Unlike redact_sensitive_text, this function does NOT respect
+    ``display_redaction_only``. The intent is: chat output and logs MUST
+    always scrub credentials, even when the global ``redact_sensitive_text``
+    is being skipped for tool results. Matches upstream PR #16849.
+    """
+    if text is None:
+        return None
+    return redact_sensitive_text(text, force=True, code_file=code_file)
 
 
 # Substrings used to gate ``_PREFIX_RE`` execution. If none of these appear in

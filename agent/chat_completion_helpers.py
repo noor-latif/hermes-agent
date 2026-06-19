@@ -812,6 +812,62 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
 
 
 
+def _is_opaque_reasoning_field(d: dict) -> bool:
+    """Return True if a reasoning_details entry holds signed/encrypted provider
+    material that MUST be preserved byte-exact for replay. Mutating these
+    breaks provider signature checks and triggers the strip-reasoning retry
+    path.
+
+    Matches the upstream boundary in PR #43940:
+      signature, encrypted_content, data, encrypted-type items, Codex
+      reasoning/message items, Gemini extra_content.
+    """
+    if not isinstance(d, dict):
+        return False
+    # Opaque top-level fields
+    if any(k in d for k in ("signature", "encrypted_content", "data")):
+        return True
+    # Codex items
+    if d.get("type") in ("reasoning", "message"):
+        return True
+    # Encrypted-flagged items
+    if d.get("type") == "encrypted":
+        return True
+    # Gemini thought_signature
+    if "thought_signature" in d or "extra_content" in d:
+        return True
+    return False
+
+
+def _redact_reasoning_detail(d: dict) -> dict:
+    """Copy-on-write redaction of a single reasoning_details entry.
+
+    Returns a NEW dict (the input is never mutated). Opaque provider
+    material is returned byte-exact. Text fields (``text``, ``summary``,
+    ``thinking``) are run through ``redact_sensitive_text``. Other keys
+    are passed through.
+
+    Matches upstream PR #43940 (persistence-boundary redaction gaps).
+    """
+    if _is_opaque_reasoning_field(d):
+        return d  # preserve byte-exact
+    out = dict(d)
+    from agent.redact import redact_sensitive_text
+    for k in ("text", "summary", "thinking"):
+        if k in out and isinstance(out[k], str):
+            out[k] = redact_sensitive_text(out[k])
+    return out
+
+
+def _redact_reasoning_str(value):
+    """Redact a string reasoning field. Returns the value unchanged if it
+    isn't a string. Empty/None passthrough."""
+    if not isinstance(value, str) or not value:
+        return value
+    from agent.redact import redact_sensitive_text
+    return redact_sensitive_text(value)
+
+
 def build_assistant_message(agent, assistant_message, finish_reason: str) -> dict:
     """Build a normalized assistant message dict from an API response message.
 
@@ -882,6 +938,14 @@ def build_assistant_message(agent, assistant_message, finish_reason: str) -> dic
         from agent.redact import redact_sensitive_text
         _san_content = redact_sensitive_text(_san_content)
 
+    # Persistence-boundary redaction for reasoning fields (PR #43940).
+    # The `content` field above is redacted; `reasoning` and
+    # `reasoning_content` were not, so a model that quoted a credential
+    # in its thinking would persist it in plaintext. Apply the same
+    # redaction here. Opaque provider material is handled separately
+    # for `reasoning_details` below.
+    reasoning_text = _redact_reasoning_str(reasoning_text)
+
     msg = {
         "role": "assistant",
         "content": _san_content,
@@ -895,7 +959,9 @@ def build_assistant_message(agent, assistant_message, finish_reason: str) -> dic
         if isinstance(model_extra, dict) and "reasoning_content" in model_extra:
             raw_reasoning_content = model_extra["reasoning_content"]
     if raw_reasoning_content is not None:
-        msg["reasoning_content"] = _sanitize_surrogates(raw_reasoning_content)
+        raw_reasoning_content = _sanitize_surrogates(raw_reasoning_content)
+        raw_reasoning_content = _redact_reasoning_str(raw_reasoning_content)
+        msg["reasoning_content"] = raw_reasoning_content
     elif assistant_tool_calls and agent._needs_thinking_reasoning_pad():
         # DeepSeek v4 thinking mode and Kimi / Moonshot thinking mode
         # both require reasoning_content on every assistant tool-call
@@ -940,6 +1006,9 @@ def build_assistant_message(agent, assistant_message, finish_reason: str) -> dic
         # Anthropic, OpenAI) can maintain reasoning continuity across turns.
         # Each provider may include opaque fields (signature, encrypted_content)
         # that must be preserved exactly.
+        # PR #43940: also redact the text fields (text/summary/thinking)
+        # before persistence, copy-on-write, with opaque items preserved
+        # byte-exact.
         raw_details = assistant_message.reasoning_details
         preserved = []
         for d in raw_details:
@@ -950,7 +1019,10 @@ def build_assistant_message(agent, assistant_message, finish_reason: str) -> dic
             elif hasattr(d, "model_dump"):
                 preserved.append(d.model_dump())
         if preserved:
-            msg["reasoning_details"] = preserved
+            msg["reasoning_details"] = [
+                _redact_reasoning_detail(d) if isinstance(d, dict) else d
+                for d in preserved
+            ]
 
     # Anthropic interleaved-thinking replay: when a turn interleaves signed
     # thinking blocks with tool_use, the parallel reasoning_details +

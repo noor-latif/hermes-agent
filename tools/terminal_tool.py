@@ -2455,9 +2455,15 @@ def terminal_tool(
             from tools.ansi_strip import strip_ansi
             output = strip_ansi(output)
 
-            # Redact secrets from command output (catches env/printenv leaking keys)
+            # Redact secrets from command output (catches env/printenv leaking keys).
+            # Pass code_file=True to skip the ENV-assignment (KEY=value) and JSON-field
+            # ("key": "value") regex passes — those produce false positives on
+            # source-code output like `cat foo.py` (MAX_TOKENS=100, "apiKey": "test").
+            # Prefix patterns (sk-, ghp_, etc.), Authorization: Bearer headers, private
+            # keys, JWTs, DB connection strings, and URL secrets are still redacted.
+            # Matches upstream PR #33840 (fix(redact): code_file=True in terminal_tool).
             from agent.redact import redact_sensitive_text
-            output = redact_sensitive_text(output.strip()) if output else ""
+            output = redact_sensitive_text(output.strip(), code_file=True) if output else ""
 
             # Interpret non-zero exit codes that aren't real errors
             # (e.g. grep=1 means "no matches", diff=1 means "files differ")

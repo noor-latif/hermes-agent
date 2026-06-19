@@ -374,7 +374,18 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         action="append",
         default=[],
         metavar="PROFILE:TITLE[:SKILL,SKILL]",
-        help="Parallel worker card (repeatable)",
+        help="Parallel worker card (repeatable). Title doubles as body unless "
+             "--worker-body is given for the same index.",
+    )
+    p_swarm.add_argument(
+        "--worker-body",
+        action="append",
+        default=[],
+        metavar="TEXT_OR_FILE",
+        help="Optional body text for the n-th --worker (repeatable, indexed). "
+             "If the value starts with '@' the rest is a path to a UTF-8 file. "
+             "Use this when the title is long and would confuse the "
+             "PROFILE:TITLE[:SKILL,...] parser.",
     )
     p_swarm.add_argument("--verifier", required=True, help="Verifier profile")
     p_swarm.add_argument("--synthesizer", required=True, help="Synthesizer/writer profile")
@@ -1376,6 +1387,33 @@ def _cmd_swarm(args: argparse.Namespace) -> int:
     if not workers:
         print("kanban swarm: at least one --worker is required", file=sys.stderr)
         return 2
+
+    # Optional per-worker body override. Indexed in parallel with --worker.
+    import dataclasses as _dc
+    bodies = list(args.worker_body or [])
+    if bodies and len(bodies) != len(workers):
+        print(
+            f"kanban swarm: --worker-body count ({len(bodies)}) does not match "
+            f"--worker count ({len(workers)})",
+            file=sys.stderr,
+        )
+        return 2
+    new_workers = []
+    for spec, raw_body in zip(workers, bodies or ()):
+        body_text = raw_body
+        if raw_body.startswith("@"):
+            try:
+                with open(raw_body[1:], "r", encoding="utf-8") as fh:
+                    body_text = fh.read()
+            except OSError as exc:
+                print(
+                    f"kanban swarm: cannot read --worker-body file {raw_body!r}: {exc}",
+                    file=sys.stderr,
+                )
+                return 2
+        new_workers.append(_dc.replace(spec, body=body_text))
+    if new_workers:
+        workers = new_workers
     with kb.connect_closing() as conn:
         created = ks.create_swarm(
             conn,

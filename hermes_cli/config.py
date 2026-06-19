@@ -2209,6 +2209,13 @@ DEFAULT_CONFIG = {
     "security": {
         "allow_private_urls": False,  # Allow requests to private/internal IPs (for OpenWrt, proxies, VPNs)
         "redact_secrets": True,
+        # When display_redaction_only=true, redact_sensitive_text() is a
+        # no-op for non-force callers (tool results, terminal output,
+        # execute_code). Real values pass through to subprocesses and to
+        # the model. Use redact_for_display() in chat/log paths that
+        # MUST still scrub (send_message, RedactingFormatter, context
+        # summaries). Matches upstream PR #16849.
+        "display_redaction_only": False,
         "tirith_enabled": True,
         "tirith_path": "tirith",
         "tirith_timeout": 5,
@@ -2299,6 +2306,19 @@ DEFAULT_CONFIG = {
         # large bulk-load of triage tasks from spending a burst of aux
         # LLM calls in one tick. Excess tasks defer to the next tick.
         "auto_decompose_per_tick": 3,
+        # Gated iteration: max number of "follow-up iteration" cards that
+        # can be spawned under a single root goal before the orchestrator
+        # is hard-stopped from spawning more. Counts new top-level cards
+        # whose title shares a root word with any existing card on the
+        # board (e.g. "Build Athar v1", "v2", ..., "v7" all share "Build Athar").
+        # When exceeded, new sibling cards with the same goal prefix are
+        # routed to `triage` instead of `ready` and require explicit user
+        # approval (`hermes kanban promote <id>`) to proceed. Default 3 —
+        # matches the v1 → v2 → v3 → v4 pattern the user said they wanted
+        # (try one iteration after each human accept, not "infinite swarm").
+        # Set to 0 to disable; set high (e.g. 50) if you want unbounded
+        # iteration for specific workflows.
+        "max_iterations_per_root": 3,
         # Stale detection: running tasks that have exceeded this many
         # seconds without a heartbeat (since ``last_heartbeat_at``) are
         # auto-reclaimed to ``ready`` on the next dispatcher tick. The

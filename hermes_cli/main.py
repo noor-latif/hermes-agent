@@ -537,6 +537,11 @@ try:
                 _early_redact = _early_sec_cfg.get("redact_secrets")
                 if _early_redact is not None:
                     os.environ["HERMES_REDACT_SECRETS"] = str(_early_redact).lower()
+                # Bridge security.display_redaction_only → HERMES_DISPLAY_REDACTION_ONLY
+                # (only meaningful when redact_secrets is also true; PR #16849 design).
+                _early_dro = _early_sec_cfg.get("display_redaction_only")
+                if _early_dro is not None:
+                    os.environ["HERMES_DISPLAY_REDACTION_ONLY"] = str(_early_dro).lower()
         _early_net_cfg = _early_cfg_raw.get("network", {})
         if isinstance(_early_net_cfg, dict) and _early_net_cfg.get("force_ipv4"):
             _FORCE_IPV4_EARLY = True
