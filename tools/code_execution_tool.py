@@ -1031,12 +1031,9 @@ def _execute_remote(
     from tools.ansi_strip import strip_ansi
     stdout_text = strip_ansi(stdout_text)
 
-    # Redact secrets. Pass code_file=True to skip the ENV-assignment
-    # (KEY=value) and JSON-field ("key": "value") regex passes which
-    # produce false positives on actual code output (MAX_TOKENS=100,
-    # "apiKey": "test" fixtures). Prefix patterns (sk-, ghp_), Authorization:
-    # Bearer headers, private keys, JWTs, DB connstrings, and URL secrets
-    # are still redacted. Matches upstream PR #33840.
+    # Redact secrets. code_file=True: execute_code output is code-execution
+    # output that often echoes source/config — skip false-positive ENV/JSON/
+    # f-string-template redaction while still masking real credentials.
     from agent.redact import redact_sensitive_text
     stdout_text = redact_sensitive_text(stdout_text, code_file=True)
 
@@ -1446,10 +1443,8 @@ def execute_code(
         # The sandbox env-var filter (lines 434-454) blocks os.environ access,
         # but scripts can still read secrets from disk (e.g. open('~/.hermes/.env')).
         # This ensures leaked secrets never enter the model context.
-        # Pass code_file=True so source-code output (e.g. `print(CONFIG)` of a
-        # Python dict) isn't corrupted by false-positive KEY=value matches.
-        # Real secrets with known prefixes (sk-, ghp_) still fire. Matches
-        # upstream PR #33840.
+        # code_file=True: this is code-execution output — skip false-positive
+        # ENV/JSON/f-string-template redaction; real credentials still masked.
         from agent.redact import redact_sensitive_text
         stdout_text = redact_sensitive_text(stdout_text, code_file=True)
         stderr_text = redact_sensitive_text(stderr_text, code_file=True)
